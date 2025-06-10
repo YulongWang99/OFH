@@ -62,7 +62,7 @@ static constexpr size_t MAX_NOF_SYMBOLS = 16;
 /// Depending on configured compression parameters one UL U-Plane message may occupy up to 2 Ethernet packets.
 static constexpr size_t MAX_NOF_PACKETS_PER_UPLANE_MESSAGE = 100;
 
-static constexpr unsigned MAX_SAVE_FRAME = 1;
+static constexpr unsigned MAX_SAVE_FRAME = 8;
 
 static constexpr unsigned MAX_DVB_FRAME_SIZE = 451584;
 
@@ -225,7 +225,7 @@ class dvb_frame_writer {
         start_prb = 0;
         number_of_prbs = 0;
       }
-      // output_file.write((const char*)frame.data(), frame.size());
+      output_file.write((const char*)frame.data(), frame.size());
       current_frame_offset += frame.size();
       return frame.size();
     }
@@ -349,31 +349,24 @@ public:
         seq_id = message_info.seq_id;
       }
       seq_id++;
-    } else if (seq_id != 0) {
-      logger.info("last seq id = {} - {}", seq_id, message_info.seq_id);
-      seq_id = 0;
     }
 
     if (message_info.end_of_frame) {
       seq_id = 0;
-      if (start_save_frame) {
-        start_save_frame = false;
-        need_save_frame = false;
-      }
     }
 
     if (start_save_frame) {
       if (!save_executor.defer([this, message_info, b = std::move(buffer)] {
-        // if (start_save_frame) {
-        //   span<const uint8_t> frame = b.data().subspan(message_info.offset, b.data().size() - message_info.offset);
-        //   if (frame_writer->write_frame(message_info, frame) < 0) {
-        //     start_save_frame = false;
-        //     need_save_frame = false;
-        //   }
-        // }
+        if (start_save_frame) {
+          span<const uint8_t> frame = b.data().subspan(message_info.offset, b.data().size() - message_info.offset);
+          if (frame_writer->write_frame(message_info, frame) < 0) {
+              start_save_frame = false;
+              need_save_frame = false;
+          }
+        }
       })) {
         logger.warning("failed to dispatch frame writer task");
-      };
+      }
     }
   }
 
@@ -586,8 +579,8 @@ struct worker_manager {
         const single_worker dvb_worker{name,
                                       {concurrent_queue_policy::lockfree_spsc, 2},
                                       {{exec_name}},
-                                      std::chrono::microseconds{0},
-                                      os_thread_realtime_priority::max()};
+                                      std::chrono::microseconds{1},
+                                      os_thread_realtime_priority::max() - 1};
         if (!exec_mng.add_execution_context(create_execution_context(dvb_worker))) {
           report_fatal_error("Failed to instantiate {} execution context", dvb_worker.name);
         }
@@ -792,7 +785,7 @@ int main(int argc, char** argv)
   timing_notifier.subscribe(dvb_symbol_notifiers);
 
   // Start dvb emulators.
-  // timing_notifier.start();
+  timing_notifier.start();
   for (auto& dvb : dvb_tx_sims) {
     dvb->start();
   }
@@ -822,7 +815,7 @@ int main(int argc, char** argv)
     }
   }
 
-  // timing_notifier.stop();
+  timing_notifier.stop();
   for (auto& txrx : transceivers) {
     txrx->stop();
   }
