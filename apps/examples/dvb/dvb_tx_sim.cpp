@@ -54,7 +54,7 @@ using namespace ofh;
 using namespace ether;
 
 /// Ethernet packet size.
-static constexpr unsigned ETHERNET_FRAME_SIZE = 9000;
+static constexpr unsigned ETHERNET_FRAME_SIZE = 2048;
 
 /// Maximum number of symbols in a slot, considering normal cyclic prefix.
 static constexpr size_t MAX_NOF_SYMBOLS = 16;
@@ -78,6 +78,8 @@ struct dvb_tx_sim_config {
   unsigned vlan_tag;
 
   unsigned nof_prb;
+
+  unsigned mtu;
 
   std::string input_file;
 };
@@ -264,7 +266,7 @@ class dvb_tx_sim : public frame_notifier, public dvb_symbol_boundary_notifier
   // Pre-generated test data for each symbol for each configured eAxC.
   std::array<eaxc_buffers, 2> test_frame_data;
   // Keeps track of last used seq_id for each eAxC.
-  circular_map<unsigned, uint8_t, MAX_SUPPORTED_EAXC_ID_VALUE> seq_counters;
+  circular_map<unsigned, uint16_t, MAX_SUPPORTED_EAXC_ID_VALUE> seq_counters;
   // Stores the list of configured eAxC.
   static_vector<unsigned, MAX_NOF_SUPPORTED_EAXC> ul_eaxc;
 
@@ -393,6 +395,10 @@ public:
     if (symbol >= MAX_NOF_SYMBOLS - 1) {
       return;
     }
+    if (symbol >= eaxc_frames.size()) {
+      logger.info("data prepare too late on frame {} symbol {}", frame_index, symbol);
+      return;
+    }
     auto& symbol_frames = eaxc_frames[symbol];
     // Set runtime header parameters.
     for (auto& frame : symbol_frames) {
@@ -488,7 +494,7 @@ private:
 
     unsigned headers_size = (ether_header_size + dvb_header_size).value();
     // Size in bytes of one PRB using the given static compression parameters.
-    unsigned rbs_per_frame = (ETHERNET_FRAME_SIZE - headers_size) / rb_size;
+    unsigned rbs_per_frame = (cfg.mtu - headers_size) / rb_size;
 
     // It is assumed that maximum 2 packets required to send symbol data for antenna.
     unsigned nof_frames = (cfg.nof_prb / rbs_per_frame) + ((cfg.nof_prb % rbs_per_frame) ? 1 : 0);
@@ -739,7 +745,7 @@ int main(int argc, char** argv)
   if (uses_dpdk) {
     dpdk_port_config port_cfg;
     port_cfg.pcie_id                     = dvb_tx_sim_cfg.network_interface;
-    port_cfg.mtu_size                    = units::bytes{ETHERNET_FRAME_SIZE};
+    port_cfg.mtu_size                    = units::bytes{dvb_tx_sim_cfg.mtu};
     port_cfg.is_promiscuous_mode_enabled = dvb_tx_sim_cfg.enable_promiscuous;
     auto ctx                             = dpdk_port_context::create(port_cfg);
     transceivers.push_back(std::make_unique<dpdk_transceiver>(logger, *workers.dvb_rx_exec[0], ctx));
@@ -748,7 +754,7 @@ int main(int argc, char** argv)
   {
     gw_config cfg;
     cfg.interface                   = dvb_tx_sim_cfg.network_interface;
-    cfg.mtu_size                    = units::bytes{ETHERNET_FRAME_SIZE};
+    cfg.mtu_size                    = units::bytes{dvb_tx_sim_cfg.mtu};
     cfg.is_promiscuous_mode_enabled = dvb_tx_sim_cfg.enable_promiscuous;
     if (!parse_mac_address(dvb_tx_sim_cfg.dst_mac_address, cfg.mac_dst_address)) {
       report_error("Invalid MAC address provided: '{}'", dvb_tx_sim_cfg.dst_mac_address);
@@ -762,6 +768,7 @@ int main(int argc, char** argv)
   emu_cfg.input_file = dvb_tx_sim_cfg.input_file;
 
   emu_cfg.vlan_tag     = dvb_tx_sim_cfg.vlan_tag;
+  emu_cfg.mtu          = dvb_tx_sim_cfg.mtu;
   if (!parse_mac_address(dvb_tx_sim_cfg.src_mac_address, emu_cfg.src_mac)) {
     report_error("Invalid MAC address provided: '{}'", dvb_tx_sim_cfg.src_mac_address);
   }

@@ -70,7 +70,7 @@ dvb_tx_sim_timing_notifier::dvb_tx_sim_timing_notifier(srslog::basic_logger&  lo
   nof_symbols_per_slot(16),
   nof_slots_per_system_frame(1),
   symbol_duration(frame_period_/nof_symbols_per_slot),
-  sleep_time(std::chrono::duration_cast<std::chrono::nanoseconds>(symbol_duration) / 8),
+  sleep_time(std::chrono::duration_cast<std::chrono::nanoseconds>(symbol_duration) / 16),
   slot_symbol_point(0,16)
 {
   // The GPS time epoch starts on 1980.1.6 so make sure that the system time is set after this date.

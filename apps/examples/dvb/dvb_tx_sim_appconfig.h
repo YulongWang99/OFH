@@ -47,6 +47,7 @@ struct dvb_tx_sim_ofh_appconfig {
   std::string dst_mac_address;
   /// V-LAN Tag control information field.
   unsigned vlan_tag;
+  unsigned mtu;
   /// Promiscuous mode flag.
   bool enable_promiscuous = false;
   /// input stream file
