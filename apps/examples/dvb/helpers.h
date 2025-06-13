@@ -95,8 +95,7 @@ inline std::string generate_time_format()
   std::ostringstream oss;
   oss << "data_"
       << std::put_time(&local_tm, "%Y%m%d_%H%M%S")
-      << "_" << std::setfill('0') << std::setw(3) << ms.count()
-      << ".log";
+      << "_" << std::setfill('0') << std::setw(3) << ms.count();
 
   return oss.str();
 }

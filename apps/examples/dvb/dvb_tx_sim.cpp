@@ -339,7 +339,7 @@ public:
     rx_total_counter.increment();
     auto message_info = decoded_message_info.value();
 
-    if (need_save_frame && message_info.start_prb == 0 && !start_save_frame) {
+    if (need_save_frame && message_info.start_prb == 0 && ((message_info.frame_id & 1) == 0) && !start_save_frame) {
       start_save_frame = true;
       std::string output_file("dvb_frame_");
       output_file += generate_time_format() + ".bin";
