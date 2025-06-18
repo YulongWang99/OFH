@@ -90,6 +90,7 @@ struct header_parameters {
   uint16_t payload_size;
   uint32_t start_prb;
   uint16_t nof_prbs;
+  bool     last_pkg;
 };
 
 typedef struct dvb_transport_header_t {
@@ -471,14 +472,53 @@ private:
   {
     units::bytes  ether_hdr_size  = eth_builder->get_header_size();
     eth_builder->build_frame(frame);
-    struct dvb_transport_header_t* dvb_head = (struct dvb_transport_header_t*)(frame.data() + ether_hdr_size.value());
-    dvb_head->frame_id = head_param.frame_id;
-    dvb_head->payload = htons(head_param.payload_size);
-    dvb_head->block_number = htons(head_param.nof_prbs);
-    dvb_head->dvb_master_id = 6;
-    dvb_head->start_block = htonl(head_param.start_prb);
-    dvb_head->version = 1;
-    dvb_head->seqid = htons(seq_counters[0]++);
+    if (head_param.last_pkg) {
+      struct dvb_transport_extend_header_t* dvb_head = (struct dvb_transport_extend_header_t*)(frame.data() + ether_hdr_size.value());
+      dvb_head->frame_id = head_param.frame_id;
+      dvb_head->payload = htons(head_param.payload_size);
+      dvb_head->block_number = htons(head_param.nof_prbs);
+      dvb_head->dvb_master_id = 6;
+      dvb_head->start_block = htonl(head_param.start_prb);
+      dvb_head->version = 1;
+      dvb_head->seqid = htons(seq_counters[0]++);
+      dvb_head->last_pkg_flag = 1;
+      dvb_head->ef = 1;
+      dvb_head->scale_factor = 0;
+      dvb_head->modcod = 1;
+    } else {
+      struct dvb_transport_header_t* dvb_head = (struct dvb_transport_header_t*)(frame.data() + ether_hdr_size.value());
+      dvb_head->frame_id = head_param.frame_id;
+      dvb_head->payload = htons(head_param.payload_size);
+      dvb_head->block_number = htons(head_param.nof_prbs);
+      dvb_head->dvb_master_id = 6;
+      dvb_head->start_block = htonl(head_param.start_prb);
+      dvb_head->version = 1;
+      dvb_head->seqid = htons(seq_counters[0]++);
+    }
+  }
+
+  void build_dvb_frame(span<uint8_t>& frame, uint8_t frame_id, unsigned data_size, unsigned start_prb, unsigned number_prb, bool last_pkg)
+  {
+    unsigned dvb_header_size = last_pkg ? sizeof(dvb_transport_extend_header_t) : sizeof(dvb_transport_header_t);
+    unsigned header_size = eth_builder->get_header_size().value();
+    // Prepare header.
+    span<uint8_t>     frame_header = frame.subspan(0, header_size + dvb_header_size);
+    header_parameters params;
+    params.frame_id = frame_id;
+    params.payload_size = data_size + dvb_header_size;
+    params.start_prb    = start_prb;
+    params.nof_prbs     = number_prb;
+    params.last_pkg = last_pkg;
+
+    set_static_header_params(frame_header, params);
+
+    // Prepare IQ data.
+    char* data_buf = (char*)frame.subspan(header_size + dvb_header_size, data_size).data();
+    input_stream.read(data_buf, data_size);
+    if(input_stream.eof()) {
+      input_stream.clear();
+      input_stream.seekg(0);
+    }
   }
 
   /// Returns pre-generated test data for each symbol.
@@ -489,7 +529,8 @@ private:
     eaxc_frames.clear();
 
     const units::bytes dvb_header_size(sizeof(struct dvb_transport_header_t));
-    const units::bytes ether_header_size(18);
+    const units::bytes dvb_ext_header_size(sizeof(struct dvb_transport_extend_header_t));
+    const units::bytes ether_header_size(eth_builder->get_header_size());
     const unsigned rb_size = 4;
 
     unsigned headers_size = (ether_header_size + dvb_header_size).value();
@@ -514,53 +555,34 @@ private:
       }
       for (unsigned j = 0; j != max_frames; ++j) {
         unsigned data_size = rbs_per_frame * rb_size;
-
         symbol_frames.emplace_back();
         std::vector<uint8_t>& frame = symbol_frames.back();
         frame.resize(headers_size + data_size);
-
-        // Prepare header.
-        span<uint8_t>     frame_header(frame.data(), headers_size);
-        header_parameters params;
-        params.frame_id = frame_id;
-        params.payload_size = data_size + dvb_header_size.value();
-        params.start_prb    = start_prb;
-        params.nof_prbs     = rbs_per_frame;
-
-        set_static_header_params(frame_header, params);
-
-        // Prepare IQ data.
-        char* data_buf = (char*)span<uint8_t>(frame).last(data_size).data();
-        input_stream.read(data_buf, data_size);
-        if(input_stream.eof()) {
-          input_stream.clear();
-          input_stream.seekg(0);
-        }
+        span<uint8_t> span_frame(frame.data(), headers_size + data_size);
+        build_dvb_frame(span_frame, frame_id, data_size, start_prb, rbs_per_frame, false);
 
         start_prb += rbs_per_frame;
       }
       if ((symbol == end - 1) && (start_prb < cfg.nof_prb)) {
-        symbol_frames.emplace_back();
         unsigned data_size = (cfg.nof_prb - start_prb) * rb_size;
+        headers_size = (ether_header_size + dvb_ext_header_size).value();
+        if (headers_size + data_size > cfg.mtu) {
+          symbol_frames.emplace_back();
+          std::vector<uint8_t>& frame = symbol_frames.back();
+          data_size = ((cfg.nof_prb - start_prb) / 2) *rb_size;
+          headers_size = (ether_header_size + dvb_header_size).value();
+          frame.resize(headers_size + data_size);
+          span<uint8_t> span_frame(frame.data(), headers_size + data_size);
+          build_dvb_frame(span_frame, frame_id, data_size, start_prb, data_size / rb_size, false);
+          start_prb += (cfg.nof_prb - start_prb) / 2;
+          data_size = (cfg.nof_prb - start_prb) * rb_size;
+          headers_size = (ether_header_size + dvb_ext_header_size).value();
+        }
+        symbol_frames.emplace_back();
         std::vector<uint8_t>& frame = symbol_frames.back();
         frame.resize(headers_size + data_size);
-        // Prepare header.
-        span<uint8_t>     frame_header(frame.data(), headers_size);
-        header_parameters params;
-        params.frame_id = frame_id;
-        params.payload_size = data_size + dvb_header_size.value();
-        params.start_prb    = start_prb;
-        params.nof_prbs     = (cfg.nof_prb - start_prb);
-
-        set_static_header_params(frame_header, params);
-
-        // Prepare IQ data.
-        char* data_buf = (char*)span<uint8_t>(frame).last(data_size).data();
-        input_stream.read(data_buf, data_size);
-        if(input_stream.eof()) {
-          input_stream.clear();
-          input_stream.seekg(0);
-        }
+        span<uint8_t> span_frame(frame.data(), headers_size + data_size);
+        build_dvb_frame(span_frame, frame_id, data_size, start_prb, data_size / rb_size, true);
       }
     }
   }
