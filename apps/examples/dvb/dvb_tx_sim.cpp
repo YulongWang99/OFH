@@ -514,10 +514,13 @@ private:
 
     // Prepare IQ data.
     char* data_buf = (char*)frame.subspan(header_size + dvb_header_size, data_size).data();
+
     input_stream.read(data_buf, data_size);
+
     if(input_stream.eof()) {
       input_stream.clear();
       input_stream.seekg(0);
+      input_stream.read(data_buf, data_size);
     }
   }
 
