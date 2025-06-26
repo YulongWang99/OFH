@@ -24,6 +24,8 @@
 #include "dvb_tx_sim_cli11_schema.h"
 #include "dvb_tx_sim_timing_notifier.h"
 #include "dvb_tx_sim_transceiver.h"
+#include "dvb_frame_pool.h"
+#include "scoped_frame_buffer.h"
 #include "helpers.h"
 #include "srsran/adt/circular_map.h"
 #include "srsran/adt/expected.h"
@@ -48,6 +50,7 @@
 #ifdef DPDK_FOUND
 #include "srsran/hal/dpdk/dpdk_eal_factory.h"
 #endif
+#include "srsran/support/srsran_assert.h"
 
 using namespace srsran;
 using namespace ofh;
@@ -260,12 +263,11 @@ class dvb_tx_sim : public frame_notifier, public dvb_symbol_boundary_notifier
   task_executor&           prepare_executor;
   task_executor&           save_executor;
   dvb_tx_sim_transceiver& transceiver;
+  dvb_tx_sim_timing_notifier& notifier;
 
   // Timing window checkers, store statistics of early/late/on-time packets.
   // RU emulator configuration.
   const dvb_tx_sim_config cfg;
-  // Pre-generated test data for each symbol for each configured eAxC.
-  std::array<eaxc_buffers, 2> test_frame_data;
   // Keeps track of last used seq_id for each eAxC.
   circular_map<unsigned, uint16_t, MAX_SUPPORTED_EAXC_ID_VALUE> seq_counters;
   // Stores the list of configured eAxC.
@@ -277,6 +279,8 @@ class dvb_tx_sim : public frame_notifier, public dvb_symbol_boundary_notifier
   kpi_counter corrupt_counter;
   kpi_counter dropped_counter;
   std::unique_ptr<ether::frame_builder>     eth_builder;
+  std::shared_ptr<dvb_frame_pool> pool;
+  unsigned nof_per_symbol;
 
   std::ifstream input_stream;
   bool need_save_frame;
@@ -289,12 +293,14 @@ public:
               task_executor&          prepare_executor_,
               task_executor&          save_executor_,
               dvb_tx_sim_transceiver& transceiver_,
+              dvb_tx_sim_timing_notifier& notifier_,
               dvb_tx_sim_config       cfg_) :
     logger(logger_),
     tx_executor(tx_executor_),
     prepare_executor(prepare_executor_),
     save_executor(save_executor_),
     transceiver(transceiver_),
+    notifier(notifier_),
     cfg(cfg_),
     input_stream(cfg_.input_file, std::ios::binary),
     need_save_frame(false),
@@ -318,6 +324,21 @@ public:
     } else {
       logger.info("failed to open {}", cfg_.input_file);
     }
+
+    const units::bytes dvb_header_size(sizeof(struct dvb_transport_header_t));
+    const units::bytes dvb_ext_header_size(sizeof(struct dvb_transport_extend_header_t));
+    const units::bytes ether_header_size(eth_builder->get_header_size());
+    const unsigned rb_size = 4;
+
+    unsigned headers_size = (ether_header_size + dvb_header_size).value();
+    // Size in bytes of one PRB using the given static compression parameters.
+    unsigned rbs_per_frame = (cfg.mtu - headers_size) / rb_size;
+
+    // It is assumed that maximum 2 packets required to send symbol data for antenna.
+    unsigned nof_frames = (cfg.nof_prb / rbs_per_frame) + ((cfg.nof_prb % rbs_per_frame) ? 1 : 0);
+
+    nof_per_symbol = (nof_frames / (MAX_NOF_SYMBOLS - 1)) + 2;
+    pool = std::make_shared<dvb_frame_pool>(cfg_.mtu, nof_per_symbol);
   }
 
   // See interface for documentation.
@@ -387,42 +408,31 @@ public:
 
   void send_dvb_frame(dvb_slot_symbol_point symbol_point) {
     static_vector<span<const uint8_t>, MAX_BURST_SIZE> frame_burst;
-    uint8_t frame_index = symbol_point.get_frame();
-    // get frame buff
-    auto& eaxc_frames = test_frame_data[frame_index & 1];
-    uint8_t symbol = symbol_point.get_symbol_index();
-    // send one symbol date
-    // Set correct header parameters and send UL U-Plane packets for each symbol.
-    if (symbol >= MAX_NOF_SYMBOLS - 1) {
+    auto        frame_buffers  = pool->read_frame_buffers(symbol_point);
+    if (frame_buffers.empty()) {
       return;
     }
-    if (symbol >= eaxc_frames.size()) {
-      logger.info("data prepare too late on frame {} symbol {}", frame_index, symbol);
-      return;
-    }
-    auto& symbol_frames = eaxc_frames[symbol];
-    // Set runtime header parameters.
-    for (auto& frame : symbol_frames) {
-      frame_burst.emplace_back(frame.data(), frame.size());
-    }
+    srsran_assert(frame_burst.size() + frame_buffers.size() <= frame_burst.capacity(), "Frame burst vector is too small");
 
+    for (const auto& frame : frame_buffers) {
+      frame_burst.emplace_back(frame->data());
+    }
     // Send symbols.
     transceiver.send(frame_burst);
+    pool->clear_sent_frame_buffers(symbol_point);
 
     // Increment TX_TOTAL counter.
     tx_total_counter.increment(frame_burst.size());
   }
 
   void prepare_dvb_frame(dvb_slot_symbol_point symbol_point) {
-    uint8_t frame_index = symbol_point.get_frame();
-    // prepare next frame data
-    generate_test_frame_data(frame_index + 1);
+    generate_test_frame_data();
   }
 
   void start()
   {
     // prepare first test_frame
-    generate_test_frame_data(0);
+    generate_test_frame_data();
     transceiver.start(*this);
   }
 
@@ -474,6 +484,7 @@ private:
     eth_builder->build_frame(frame);
     if (head_param.last_pkg) {
       struct dvb_transport_extend_header_t* dvb_head = (struct dvb_transport_extend_header_t*)(frame.data() + ether_hdr_size.value());
+      memset(dvb_head, 0, sizeof(dvb_transport_extend_header_t));
       dvb_head->frame_id = head_param.frame_id;
       dvb_head->payload = htons(head_param.payload_size);
       dvb_head->block_number = htons(head_param.nof_prbs);
@@ -487,6 +498,7 @@ private:
       dvb_head->modcod = 1;
     } else {
       struct dvb_transport_header_t* dvb_head = (struct dvb_transport_header_t*)(frame.data() + ether_hdr_size.value());
+      memset(dvb_head, 0, sizeof(dvb_transport_header_t));
       dvb_head->frame_id = head_param.frame_id;
       dvb_head->payload = htons(head_param.payload_size);
       dvb_head->block_number = htons(head_param.nof_prbs);
@@ -524,12 +536,41 @@ private:
     }
   }
 
-  /// Returns pre-generated test data for each symbol.
-  void generate_test_frame_data(unsigned frame_id)
+  unsigned enqueue_dvb_frame_in_symbol(const span<uint8_t>& frame, uint8_t frame_id,  unsigned start_prb, unsigned number_prb, bool last_pkg, span<uint8_t> data)
   {
-    // Vector of bytes for each frame (up to 2) of each OFDM symbol of each eAxC.
-    eaxc_buffers& eaxc_frames = test_frame_data[frame_id & 1];
-    eaxc_frames.clear();
+    unsigned dvb_header_size = last_pkg ? sizeof(dvb_transport_extend_header_t) : sizeof(dvb_transport_header_t);
+    unsigned header_size = eth_builder->get_header_size().value();
+    // Prepare header.
+    span<uint8_t>     frame_header = data.subspan(0, header_size + dvb_header_size);
+    header_parameters params;
+    params.frame_id = frame_id;
+    params.payload_size = frame.size() + dvb_header_size;
+    params.start_prb    = start_prb;
+    params.nof_prbs     = number_prb;
+    params.last_pkg = last_pkg;
+
+    set_static_header_params(frame_header, params);
+
+    // Prepare IQ data.
+    memcpy(data.data() + header_size + dvb_header_size, frame.data(), frame.size());
+    return params.payload_size + header_size;
+  }
+
+  void generate_test_frame_data()
+  {
+    std::vector<uint8_t> frame_buf;
+    frame_buf.resize(MAX_DVB_FRAME_SIZE);
+    unsigned read_size = 0;
+    while (read_size < MAX_DVB_FRAME_SIZE) {
+      input_stream.read((char*)frame_buf.data() + read_size, MAX_DVB_FRAME_SIZE - read_size);
+      read_size += input_stream.gcount();
+      if(input_stream.eof()) {
+        input_stream.clear();
+        input_stream.seekg(0);
+        input_stream.read((char*)frame_buf.data() + read_size, MAX_DVB_FRAME_SIZE - read_size);
+        read_size += input_stream.gcount();
+      }
+    }
 
     const units::bytes dvb_header_size(sizeof(struct dvb_transport_header_t));
     const units::bytes dvb_ext_header_size(sizeof(struct dvb_transport_extend_header_t));
@@ -539,54 +580,50 @@ private:
     unsigned headers_size = (ether_header_size + dvb_header_size).value();
     // Size in bytes of one PRB using the given static compression parameters.
     unsigned rbs_per_frame = (cfg.mtu - headers_size) / rb_size;
-
-    // It is assumed that maximum 2 packets required to send symbol data for antenna.
     unsigned nof_frames = (cfg.nof_prb / rbs_per_frame) + ((cfg.nof_prb % rbs_per_frame) ? 1 : 0);
-
-    // Initializes IQ data and Ethernet packet headers (timestamp and sequence index
-    // will be updated on every transmission).
     unsigned nof_frames_persymbol = nof_frames / (MAX_NOF_SYMBOLS - 1);
     unsigned left_frame = nof_frames - nof_frames_persymbol * (MAX_NOF_SYMBOLS - 1);
-
     unsigned start_prb = 0;
+
+    span<uint8_t> frame(frame_buf.data(), frame_buf.size());
+    unsigned frame_id = notifier.get_current_frame() + 1; /*next frame to send */
+    dvb_slot_symbol_point symbol_point(frame_id * 16, 16);
+
+    pool->clear_downlink_frame(frame_id, logger);
+
     for (unsigned symbol = 0, end = MAX_NOF_SYMBOLS - 1; symbol != end; ++symbol) {
-      eaxc_frames.emplace_back();
-      auto& symbol_frames = eaxc_frames.back();
+      scoped_frame_buffer frame_buffers(*pool, symbol_point);
       unsigned max_frames = nof_frames_persymbol + ((left_frame > 1) ? 1 : 0);
       if (left_frame > 1) {
         left_frame--;
       }
       for (unsigned j = 0; j != max_frames; ++j) {
-        unsigned data_size = rbs_per_frame * rb_size;
-        symbol_frames.emplace_back();
-        std::vector<uint8_t>& frame = symbol_frames.back();
-        frame.resize(headers_size + data_size);
-        span<uint8_t> span_frame(frame.data(), headers_size + data_size);
-        build_dvb_frame(span_frame, frame_id, data_size, start_prb, rbs_per_frame, false);
-
+        ether::frame_buffer& frame_buffer = frame_buffers.get_next_frame();
+        span<uint8_t>        data         = frame_buffer.data();
+        unsigned used_size = enqueue_dvb_frame_in_symbol(frame.subspan(start_prb * rb_size, rbs_per_frame * rb_size), frame_id, start_prb, rbs_per_frame, false, data);
+        frame_buffer.set_size(used_size);
         start_prb += rbs_per_frame;
       }
       if ((symbol == end - 1) && (start_prb < cfg.nof_prb)) {
         unsigned data_size = (cfg.nof_prb - start_prb) * rb_size;
         headers_size = (ether_header_size + dvb_ext_header_size).value();
         if (headers_size + data_size > cfg.mtu) {
-          symbol_frames.emplace_back();
-          std::vector<uint8_t>& frame = symbol_frames.back();
+          ether::frame_buffer& frame_buffer = frame_buffers.get_next_frame();
+          span<uint8_t>        data         = frame_buffer.data();
           data_size = ((cfg.nof_prb - start_prb) / 2) *rb_size;
           headers_size = (ether_header_size + dvb_header_size).value();
-          frame.resize(headers_size + data_size);
-          span<uint8_t> span_frame(frame.data(), headers_size + data_size);
-          build_dvb_frame(span_frame, frame_id, data_size, start_prb, data_size / rb_size, false);
+          unsigned used_size = enqueue_dvb_frame_in_symbol(frame.subspan(start_prb * rb_size, data_size), frame_id, start_prb, data_size / rb_size, false, data);
+          frame_buffer.set_size(used_size);
           start_prb += (cfg.nof_prb - start_prb) / 2;
           data_size = (cfg.nof_prb - start_prb) * rb_size;
           headers_size = (ether_header_size + dvb_ext_header_size).value();
         }
-        symbol_frames.emplace_back();
-        std::vector<uint8_t>& frame = symbol_frames.back();
-        frame.resize(headers_size + data_size);
-        span<uint8_t> span_frame(frame.data(), headers_size + data_size);
-        build_dvb_frame(span_frame, frame_id, data_size, start_prb, data_size / rb_size, true);
+        ether::frame_buffer& frame_buffer = frame_buffers.get_next_frame();
+        span<uint8_t>        data         = frame_buffer.data();
+        unsigned used_size = enqueue_dvb_frame_in_symbol(frame.subspan(start_prb * rb_size, data_size), frame_id, start_prb, data_size / rb_size, true, data);
+        frame_buffer.set_size(used_size);
       }
+      symbol_point += 1;
     }
   }
 };
@@ -800,13 +837,11 @@ int main(int argc, char** argv)
   if (!parse_mac_address(dvb_tx_sim_cfg.dst_mac_address, emu_cfg.dst_mac)) {
     report_error("Invalid MAC address provided: '{}'", dvb_tx_sim_cfg.dst_mac_address);
   }
-
-  dvb_tx_sims.push_back(std::make_unique<dvb_tx_sim>(
-      logger, *workers.dvb_tx_sims_exec[0], *workers.dvb_prepare_frame_exec[0], *workers.dvb_save_frame_exec[0], *transceivers[0], emu_cfg));
-
-
   // Create timing worker.
   dvb_tx_sim_timing_notifier timing_notifier(logger, *workers.dvb_timing_exec, dvb_tx_sim_cfg.frame_period);
+
+  dvb_tx_sims.push_back(std::make_unique<dvb_tx_sim>(
+      logger, *workers.dvb_tx_sims_exec[0], *workers.dvb_prepare_frame_exec[0], *workers.dvb_save_frame_exec[0], *transceivers[0], timing_notifier, emu_cfg));
 
   // Subscribe RU emulator window checkers to the 'OTA symbol start' notifications.
   std::vector<dvb_symbol_boundary_notifier*> dvb_symbol_notifiers;

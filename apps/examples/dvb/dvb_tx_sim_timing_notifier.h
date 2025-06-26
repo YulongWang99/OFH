@@ -141,6 +141,9 @@ public:
   /// Stops operation of the timing notifier.
   void stop();
 
+  unsigned get_current_frame() { return slot_symbol_point.get_frame(); }
+  const dvb_slot_symbol_point& get_symbol_point() { return slot_symbol_point; }
+
   /// See interface for documentation.
   void subscribe(span<dvb_symbol_boundary_notifier*> notifiers) override;
 
