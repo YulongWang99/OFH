@@ -509,33 +509,6 @@ private:
     }
   }
 
-  void build_dvb_frame(span<uint8_t>& frame, uint8_t frame_id, unsigned data_size, unsigned start_prb, unsigned number_prb, bool last_pkg)
-  {
-    unsigned dvb_header_size = last_pkg ? sizeof(dvb_transport_extend_header_t) : sizeof(dvb_transport_header_t);
-    unsigned header_size = eth_builder->get_header_size().value();
-    // Prepare header.
-    span<uint8_t>     frame_header = frame.subspan(0, header_size + dvb_header_size);
-    header_parameters params;
-    params.frame_id = frame_id;
-    params.payload_size = data_size + dvb_header_size;
-    params.start_prb    = start_prb;
-    params.nof_prbs     = number_prb;
-    params.last_pkg = last_pkg;
-
-    set_static_header_params(frame_header, params);
-
-    // Prepare IQ data.
-    char* data_buf = (char*)frame.subspan(header_size + dvb_header_size, data_size).data();
-
-    input_stream.read(data_buf, data_size);
-
-    if(input_stream.eof()) {
-      input_stream.clear();
-      input_stream.seekg(0);
-      input_stream.read(data_buf, data_size);
-    }
-  }
-
   unsigned enqueue_dvb_frame_in_symbol(const span<uint8_t>& frame, uint8_t frame_id,  unsigned start_prb, unsigned number_prb, bool last_pkg, span<uint8_t> data)
   {
     unsigned dvb_header_size = last_pkg ? sizeof(dvb_transport_extend_header_t) : sizeof(dvb_transport_header_t);
@@ -596,7 +569,10 @@ private:
       unsigned max_frames = nof_frames_persymbol + ((left_frame > 1) ? 1 : 0);
       if (left_frame > 1) {
         left_frame--;
+      } else if (!left_frame && symbol ==  end - 1) {
+        max_frames -= 1;
       }
+
       for (unsigned j = 0; j != max_frames; ++j) {
         ether::frame_buffer& frame_buffer = frame_buffers.get_next_frame();
         span<uint8_t>        data         = frame_buffer.data();
@@ -604,6 +580,7 @@ private:
         frame_buffer.set_size(used_size);
         start_prb += rbs_per_frame;
       }
+
       if ((symbol == end - 1) && (start_prb < cfg.nof_prb)) {
         unsigned data_size = (cfg.nof_prb - start_prb) * rb_size;
         headers_size = (ether_header_size + dvb_ext_header_size).value();
